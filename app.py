@@ -975,6 +975,56 @@ def yoto_update_card_cover(
     return resp.json().get("card", {})
 
 
+def _yoto_renumber_chapters(chapters: list[dict]) -> list[dict]:
+    """Reassign sequential keys/overlay labels (01, 02, …) after reordering or removal."""
+    renumbered = []
+    for i, ch in enumerate(chapters):
+        ch = dict(ch)
+        ch["key"]          = f"{i + 1:02d}"
+        ch["overlayLabel"] = str(i + 1)
+        ch["tracks"] = [
+            {**tr, "overlayLabel": str(i + 1)} for tr in ch.get("tracks", [])
+        ]
+        renumbered.append(ch)
+    return renumbered
+
+
+def yoto_update_card_content(
+    access_token: str,
+    card_id: str,
+    title: str | None = None,
+    chapters: list[dict] | None = None,
+) -> dict:
+    """
+    Update a card's playlist name and/or track list in a single API call.
+    Pass `title` to rename the card, and/or `chapters` (already edited/renumbered)
+    to change, rename, or remove tracks.
+    """
+    existing   = yoto_get_card_details(access_token, card_id)
+    ex_content = dict(existing.get("content", {}))
+
+    if chapters is not None:
+        ex_content["chapters"] = chapters
+
+    body = {
+        "cardId":  card_id,
+        "title":   title if title is not None else existing.get("title", ""),
+        "content": ex_content,
+    }
+
+    resp = requests.post(
+        f"{YOTO_API_URL}/content",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type":  "application/json",
+        },
+        json=body,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json().get("card", {})
+
+
 def yoto_upload_card(
     access_token: str,
     card_title: str,
@@ -1141,7 +1191,7 @@ with st.sidebar:
             st.session_state.pop("_yoto_pkce", None)
             if os.path.exists(YOTO_TOKEN_FILE):
                 os.remove(YOTO_TOKEN_FILE)
-            st.experimental_rerun()
+            st.rerun()
     else:
         st.caption(
             "Log in once — credentials are saved and auto-refreshed. "
@@ -1167,7 +1217,7 @@ with st.sidebar:
                     "client_id": _client_id,
                     "auth_url":  _auth_url,
                 }
-                st.experimental_rerun()
+                st.rerun()
         else:
             _auth_url = _pkce["auth_url"]
             st.markdown(f"**Step 1** — [Click here to log in with YOTO]({_auth_url})")
@@ -1199,13 +1249,13 @@ with st.sidebar:
                             st.session_state["_yoto_access_token"] = _at
                             st.session_state["_yoto_client_id"]    = _pkce["client_id"]
                             st.session_state.pop("_yoto_pkce", None)
-                            st.experimental_rerun()
+                            st.rerun()
                     except Exception as _e:
                         st.error(f"Login failed: {_e}")
             with col_cancel:
                 if st.button("Cancel", key="sb_cancel"):
                     st.session_state.pop("_yoto_pkce", None)
-                    st.experimental_rerun()
+                    st.rerun()
 
     st.divider()
 
@@ -1422,7 +1472,7 @@ if uploaded:
         _status.empty()
 
         # Rerun so results render cleanly outside this button block
-        st.experimental_rerun()
+        st.rerun()
 
 
 # ── Results — always visible once processed (reads session state) ─────────────
@@ -1660,9 +1710,14 @@ else:
         if not _cards:
             st.info("No MYO cards found in your library.")
         else:
-            _card_opts    = {c["title"]: c["cardId"] for c in _cards}
-            _sel_title    = st.selectbox("Select a playlist", list(_card_opts.keys()), key="playlist_select")
-            _sel_id       = _card_opts[_sel_title]
+            _title_by_id  = {c["cardId"]: c["title"] for c in _cards}
+            _sel_id       = st.selectbox(
+                "Select a playlist",
+                list(_title_by_id.keys()),
+                format_func=lambda cid: _title_by_id.get(cid, cid),
+                key="playlist_select",
+            )
+            _sel_title    = _title_by_id.get(_sel_id, "")
 
             _col_det, _col_cov = st.columns([2, 1])
             with _col_det:
@@ -1743,6 +1798,107 @@ else:
                                 st.success("✅ Icons updated! Refresh the YOTO app to see changes.")
                             except Exception as _ex:
                                 st.error(f"Update failed: {_ex}")
+
+                    # ── Edit playlist — rename, rename tracks, remove tracks ──────
+                    st.divider()
+                    st.markdown("#### ✏️ Edit playlist")
+                    st.caption(
+                        "Rename the playlist, rename individual tracks, or check "
+                        "**Remove** on one or more tracks — then save."
+                    )
+
+                    _edit_key     = f"_yoto_edit_{_sel_id}"
+                    _current_name = _detail.get("title", _sel_title)
+
+                    _new_name = st.text_input(
+                        "Playlist name",
+                        value=_current_name,
+                        key=f"edit_name_{_sel_id}",
+                    )
+
+                    _edit_rows = [
+                        {"Remove": False, "#": i + 1, "Track title": _ch.get("title", "")}
+                        for i, _ch in enumerate(_chapters)
+                    ]
+
+                    _edited_rows = st.data_editor(
+                        _edit_rows,
+                        hide_index=True,
+                        use_container_width=True,
+                        disabled=["#"],
+                        column_config={
+                            "Remove": st.column_config.CheckboxColumn(
+                                "Remove", help="Check to delete this track"
+                            ),
+                            "#": st.column_config.NumberColumn("#", width="small"),
+                            "Track title": st.column_config.TextColumn(
+                                "Track title", width="large"
+                            ),
+                        },
+                        key=_edit_key,
+                    )
+
+                    _num_removed    = sum(1 for r in _edited_rows if r["Remove"])
+                    _num_remaining  = len(_edited_rows) - _num_removed
+
+                    if _num_removed:
+                        st.caption(
+                            f"🗑️ {_num_removed} track(s) marked for removal — "
+                            f"{_num_remaining} will remain."
+                        )
+
+                    _save_disabled = _num_remaining == 0
+                    if _save_disabled:
+                        st.warning("At least one track must remain on the card.")
+
+                    _col_save, _col_discard = st.columns([1, 1])
+                    with _col_save:
+                        _save_edits = st.button(
+                            "💾 Save changes",
+                            key="save_playlist_edits",
+                            use_container_width=True,
+                            disabled=_save_disabled,
+                        )
+                    with _col_discard:
+                        if st.button(
+                            "↺ Discard edits",
+                            key="discard_playlist_edits",
+                            use_container_width=True,
+                        ):
+                            st.session_state.pop(_edit_key, None)
+                            st.rerun()
+
+                    if _save_edits:
+                        _new_chapters = []
+                        for _row, _ch in zip(_edited_rows, _chapters):
+                            if _row["Remove"]:
+                                continue
+                            _ch = dict(_ch)
+                            _new_title = _row["Track title"].strip() or _ch.get("title", "Track")
+                            _ch["title"]  = _new_title
+                            _ch["tracks"] = [
+                                {**_tr, "title": _new_title} for _tr in _ch.get("tracks", [])
+                            ]
+                            _new_chapters.append(_ch)
+
+                        _new_chapters = _yoto_renumber_chapters(_new_chapters)
+                        _final_name   = _new_name.strip() or _current_name
+
+                        with st.spinner("Saving changes to YOTO…"):
+                            try:
+                                yoto_update_card_content(
+                                    _tok, _sel_id,
+                                    title=_final_name,
+                                    chapters=_new_chapters,
+                                )
+                                st.session_state["_yoto_card_detail"]    = yoto_get_card_details(_tok, _sel_id)
+                                st.session_state["_yoto_card_detail_id"] = _sel_id
+                                st.session_state["_yoto_cards"]          = yoto_get_my_content(_tok)
+                                st.session_state.pop(_edit_key, None)
+                                st.success("✅ Playlist updated!")
+                                st.rerun()
+                            except Exception as _ex:
+                                st.error(f"Failed to save changes: {_ex}")
 
 st.divider()
 st.caption(
