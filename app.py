@@ -1804,11 +1804,13 @@ else:
                     st.markdown("#### ✏️ Edit playlist")
                     st.caption(
                         "Rename the playlist, rename individual tracks, or check "
-                        "**Remove** on one or more tracks — then save."
+                        "**Remove** on one or more tracks (use **Select all** to bulk-select) "
+                        "— then save."
                     )
 
-                    _edit_key     = f"_yoto_edit_{_sel_id}"
-                    _current_name = _detail.get("title", _sel_title)
+                    _edit_key       = f"_yoto_edit_{_sel_id}"
+                    _select_all_key = f"_yoto_edit_select_all_{_sel_id}"
+                    _current_name   = _detail.get("title", _sel_title)
 
                     _new_name = st.text_input(
                         "Playlist name",
@@ -1816,8 +1818,25 @@ else:
                         key=f"edit_name_{_sel_id}",
                     )
 
+                    _col_all, _col_none, _col_spacer = st.columns([1, 1, 3])
+                    with _col_all:
+                        if st.button(
+                            "☑️ Select all", key="select_all_tracks", use_container_width=True
+                        ):
+                            st.session_state[_select_all_key] = True
+                            st.session_state.pop(_edit_key, None)
+                            st.rerun()
+                    with _col_none:
+                        if st.button(
+                            "⬜ Clear all", key="clear_all_tracks", use_container_width=True
+                        ):
+                            st.session_state[_select_all_key] = False
+                            st.session_state.pop(_edit_key, None)
+                            st.rerun()
+
+                    _default_checked = st.session_state.get(_select_all_key, False)
                     _edit_rows = [
-                        {"Remove": False, "#": i + 1, "Track title": _ch.get("title", "")}
+                        {"Remove": _default_checked, "#": i + 1, "Track title": _ch.get("title", "")}
                         for i, _ch in enumerate(_chapters)
                     ]
 
@@ -1866,6 +1885,7 @@ else:
                             use_container_width=True,
                         ):
                             st.session_state.pop(_edit_key, None)
+                            st.session_state.pop(_select_all_key, None)
                             st.rerun()
 
                     if _save_edits:
@@ -1895,6 +1915,7 @@ else:
                                 st.session_state["_yoto_card_detail_id"] = _sel_id
                                 st.session_state["_yoto_cards"]          = yoto_get_my_content(_tok)
                                 st.session_state.pop(_edit_key, None)
+                                st.session_state.pop(_select_all_key, None)
                                 st.success("✅ Playlist updated!")
                                 st.rerun()
                             except Exception as _ex:
