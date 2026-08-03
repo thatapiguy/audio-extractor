@@ -1025,6 +1025,87 @@ def yoto_update_card_content(
     return resp.json().get("card", {})
 
 
+def yoto_resolve_track_url(access_token: str, card_id: str, track: dict) -> str | None:
+    """
+    Resolve a track's `trackUrl` to a directly downloadable audio URL.
+
+    Tracks may already carry a full https URL, or the internal `yoto:#<mediaId>`
+    reference — in which case we resolve it via YOTO's (undocumented) media
+    endpoint, which returns or redirects to a presigned CDN URL.
+    """
+    raw = (track.get("trackUrl") or "").strip()
+    if raw.startswith("http"):
+        return raw
+
+    media_id = raw.replace("yoto:#", "").strip()
+    if not media_id:
+        return None
+
+    try:
+        resp = requests.get(
+            f"{YOTO_API_URL}/card/{card_id}/media/{media_id}",
+            params={"accel": "true", "nossl": "true"},
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=20,
+            allow_redirects=False,
+        )
+    except requests.RequestException:
+        return None
+
+    if resp.status_code in (301, 302, 303, 307, 308):
+        return resp.headers.get("Location")
+
+    if resp.ok:
+        try:
+            data = resp.json()
+        except ValueError:
+            return None
+        for key in ("url", "mediaUrl", "downloadUrl", "presignedUrl"):
+            if data.get(key):
+                return data[key]
+
+    return None
+
+
+def yoto_download_card_tracks(
+    access_token: str,
+    card_id: str,
+    chapters: list[dict],
+    progress_callback=None,
+) -> tuple[list[tuple[str, bytes]], list[str]]:
+    """
+    Download the audio for every track in `chapters` (one file per chapter).
+    Returns (files, errors) — files is a list of (filename, audio_bytes);
+    errors describes any tracks that couldn't be resolved/downloaded.
+    """
+    files  = []
+    errors = []
+    total  = len(chapters) or 1
+
+    for i, ch in enumerate(chapters):
+        title  = ch.get("title") or f"Track {i + 1}"
+        tracks = ch.get("tracks", [])
+        track  = tracks[0] if tracks else {}
+
+        url = yoto_resolve_track_url(access_token, card_id, track)
+        if not url:
+            errors.append(f"Track {i + 1} ({title}): could not resolve a download URL")
+        else:
+            try:
+                resp = requests.get(url, timeout=120)
+                resp.raise_for_status()
+                ext = (track.get("format") or "mp3").lower().lstrip(".")
+                safe_title = re.sub(r"[^\w\s-]", "", title).strip().replace(" ", "_") or "Track"
+                files.append((f"{i + 1:02d}_{safe_title}.{ext}", resp.content))
+            except requests.RequestException as e:
+                errors.append(f"Track {i + 1} ({title}): {e}")
+
+        if progress_callback:
+            progress_callback((i + 1) / total)
+
+    return files, errors
+
+
 def yoto_upload_card(
     access_token: str,
     card_title: str,
@@ -1920,6 +2001,68 @@ else:
                                 st.rerun()
                             except Exception as _ex:
                                 st.error(f"Failed to save changes: {_ex}")
+
+                    # ── Download all tracks as ZIP (e.g. for Audiobookshelf) ──────
+                    st.divider()
+                    st.markdown("##### 📦 Download tracks")
+                    st.caption(
+                        "Download every track below (skipping any checked **Remove**, "
+                        "using your renamed titles) as a ZIP of individual audio "
+                        "files — handy for importing into Audiobookshelf. This uses "
+                        "an unofficial YOTO endpoint, so a track may occasionally "
+                        "fail to resolve; failures are listed below and don't block "
+                        "the rest of the download."
+                    )
+
+                    _zip_key = f"_yoto_dl_zip_{_sel_id}"
+
+                    if st.button(
+                        "📦 Prepare ZIP of tracks",
+                        key="prep_tracks_zip",
+                        use_container_width=True,
+                    ):
+                        _keep_chapters = [
+                            {**_ch, "title": _row["Track title"].strip() or _ch.get("title", "Track")}
+                            for _row, _ch in zip(_edited_rows, _chapters)
+                            if not _row["Remove"]
+                        ]
+                        if not _keep_chapters:
+                            st.warning("No tracks to download — all are marked for removal.")
+                        else:
+                            _dl_bar = st.progress(0.0, text="Downloading tracks…")
+                            _files, _dl_errors = yoto_download_card_tracks(
+                                _tok, _sel_id,
+                                chapters=_keep_chapters,
+                                progress_callback=lambda f: _dl_bar.progress(
+                                    f, text=f"Downloading tracks… {int(f * 100)}%"
+                                ),
+                            )
+                            _dl_bar.empty()
+
+                            if _files:
+                                st.session_state[_zip_key] = build_zip(_files)
+                                st.success(f"✅ {len(_files)} track(s) ready to download.")
+                            else:
+                                st.session_state.pop(_zip_key, None)
+
+                            if _dl_errors:
+                                st.warning(
+                                    f"{len(_dl_errors)} of {len(_keep_chapters)} track(s) "
+                                    "couldn't be downloaded:\n\n"
+                                    + "\n".join(f"- {e}" for e in _dl_errors)
+                                )
+
+                    _tracks_zip = st.session_state.get(_zip_key)
+                    if _tracks_zip:
+                        _safe_zip_name = re.sub(r"[^\w\s-]", "", _current_name).strip().replace(" ", "_") or "playlist"
+                        st.download_button(
+                            label=f"⬇️ Download ZIP  ({len(_tracks_zip) / (1024 * 1024):.1f} MB)",
+                            data=_tracks_zip,
+                            file_name=f"{_safe_zip_name}.zip",
+                            mime="application/zip",
+                            use_container_width=True,
+                            key="dl_yoto_tracks_zip",
+                        )
 
 st.divider()
 st.caption(
